@@ -62,6 +62,63 @@ export interface EventEnvelopeLike<TData extends JsonObject = JsonObject> {
   metadata?: JsonObject;
 }
 
+export const WEBHOOK_ROUTE_STATUSES = [
+  "active",
+  "disabled",
+  "archived",
+] as const;
+
+export type WebhookRouteStatus = (typeof WEBHOOK_ROUTE_STATUSES)[number];
+
+export type WebhookSignatureAlgorithm = "hmac-sha256";
+export type WebhookSignatureEncoding = "hex" | "base64";
+
+export interface WebhookSignatureConfig {
+  algorithm: WebhookSignatureAlgorithm;
+  secretRef: string;
+  header?: string;
+  encoding?: WebhookSignatureEncoding;
+  prefix?: string;
+}
+
+export interface WebhookEventMapping {
+  source: string;
+  type: string;
+  subject?: string;
+  subjectPath?: string;
+  dataPath?: string;
+  idPath?: string;
+  timePath?: string;
+  dedupeKeyPath?: string;
+  dedupeKeyHeader?: string;
+  metadata?: JsonObject;
+}
+
+export interface WebhookRoute {
+  id: string;
+  automationId: string;
+  path: string;
+  status: WebhookRouteStatus;
+  signature?: WebhookSignatureConfig;
+  mapping: WebhookEventMapping;
+  createdAt: string;
+  updatedAt: string;
+  metadata?: JsonObject;
+}
+
+export interface WebhookRequestInput {
+  route: WebhookRoute;
+  rawBody: string | Uint8Array;
+  headers?: Record<string, string | undefined>;
+  receivedAt?: string | Date;
+}
+
+export interface MaterializedWebhookRequest {
+  route: WebhookRoute;
+  event: EventEnvelopeLike;
+  materialized: MaterializedEventRun[];
+}
+
 export type AutomationApprovalGateTemplate = Omit<ApprovalGate, "decision"> & {
   decision?: never;
 };
@@ -165,6 +222,7 @@ export interface AutomationsStatus {
     queuedActions: number;
     deadActions: number;
     replayRequests: number;
+    webhookRoutes: number;
   };
   daemon: {
     leaseId?: string;
@@ -173,6 +231,7 @@ export interface AutomationsStatus {
     heartbeatAt?: string;
     expiresAt?: string;
     active: boolean;
+    metadata?: JsonObject;
   };
 }
 

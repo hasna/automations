@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { hostname } from "node:os";
 import { dirname } from "node:path";
@@ -26,14 +26,20 @@ import type {
   AutomationStatus,
   AutomationTrigger,
   EventEnvelopeLike,
+  MaterializedWebhookRequest,
   MaterializedEventRun,
   QueueClaimOptions,
   QueuedAction,
+  WebhookEventMapping,
+  WebhookRequestInput,
+  WebhookRoute,
+  WebhookRouteStatus,
+  WebhookSignatureConfig,
 } from "../types.js";
-import { AUTOMATION_SCHEMA_VERSION, AUTOMATION_STATUSES, AUTOMATION_TRIGGER_KINDS } from "../types.js";
+import { AUTOMATION_SCHEMA_VERSION, AUTOMATION_STATUSES, AUTOMATION_TRIGGER_KINDS, WEBHOOK_ROUTE_STATUSES } from "../types.js";
 import { automationsDataDir, automationsDbPath, ensureAutomationsDataDir } from "./paths.js";
 
-const STORE_SCHEMA_VERSION = 1;
+const STORE_SCHEMA_VERSION = 3;
 
 interface CountRow {
   count: number;
@@ -103,6 +109,19 @@ interface DaemonLeaseRow {
   expires_at: string;
   created_at: string;
   updated_at: string;
+  metadata_json: string | null;
+}
+
+interface WebhookRouteRow {
+  id: string;
+  automation_id: string;
+  path: string;
+  status: WebhookRouteStatus;
+  signature_json: string | null;
+  mapping_json: string;
+  created_at: string;
+  updated_at: string;
+  metadata_json: string | null;
 }
 
 export interface AutomationsStoreOptions {
@@ -124,6 +143,16 @@ export interface EnqueueActionInput {
   result?: ActionResult;
   error?: ActionError;
   deadLetter?: ActionDeadLetter;
+  metadata?: JsonObject;
+}
+
+export interface CreateWebhookRouteInput {
+  id?: string;
+  automationId: string;
+  path?: string;
+  status?: WebhookRouteStatus;
+  signature?: WebhookSignatureConfig;
+  mapping: WebhookEventMapping;
   metadata?: JsonObject;
 }
 
@@ -175,6 +204,85 @@ export class AutomationsStore {
     const row = this.db.query("SELECT * FROM automations WHERE id = $id").get({ $id: id }) as AutomationRow | null;
     if (!row) throw new Error(`automation not found: ${id}`);
     return automationFromRow(row);
+  }
+
+  createWebhookRoute(input: CreateWebhookRouteInput): WebhookRoute {
+    this.requireAutomation(input.automationId);
+    const id = input.id ?? randomUUID();
+    const path = normalizeWebhookPath(input.path ?? `/webhooks/${id}`);
+    const status = input.status ?? "active";
+    const signature = canonicalWebhookSignature(input.signature);
+    validateWebhookRouteFields({ id, path, status, signature, mapping: input.mapping });
+    const timestamp = nowIso();
+    this.db.query(`
+      INSERT INTO webhook_routes (
+        id, automation_id, path, status, signature_json, mapping_json, created_at, updated_at, metadata_json
+      )
+      VALUES (
+        $id, $automationId, $path, $status, $signatureJson, $mappingJson, $createdAt, $updatedAt, $metadataJson
+      )
+      ON CONFLICT(id) DO UPDATE SET
+        automation_id = excluded.automation_id,
+        path = excluded.path,
+        status = excluded.status,
+        signature_json = excluded.signature_json,
+        mapping_json = excluded.mapping_json,
+        updated_at = excluded.updated_at,
+        metadata_json = excluded.metadata_json
+    `).run({
+      $id: id,
+      $automationId: input.automationId,
+      $path: path,
+      $status: status,
+      $signatureJson: stringifyNullable(signature),
+      $mappingJson: JSON.stringify(input.mapping),
+      $createdAt: timestamp,
+      $updatedAt: timestamp,
+      $metadataJson: stringifyNullable(input.metadata),
+    });
+    return this.requireWebhookRoute(id);
+  }
+
+  listWebhookRoutes(): WebhookRoute[] {
+    return this.db.query("SELECT * FROM webhook_routes ORDER BY created_at ASC").all().map((row) => webhookRouteFromRow(row as WebhookRouteRow));
+  }
+
+  requireWebhookRoute(idOrPath: string): WebhookRoute {
+    const row = this.db.query(`
+      SELECT * FROM webhook_routes
+      WHERE id = $idOrPath OR path = $idOrPath
+      LIMIT 1
+    `).get({ $idOrPath: idOrPath }) as WebhookRouteRow | null;
+    if (!row) throw new Error(`webhook route not found: ${idOrPath}`);
+    return webhookRouteFromRow(row);
+  }
+
+  setWebhookRouteStatus(idOrPath: string, status: WebhookRouteStatus): WebhookRoute {
+    if (!(WEBHOOK_ROUTE_STATUSES as readonly string[]).includes(status)) {
+      throw new Error(`unsupported webhook route status: ${status}`);
+    }
+    const route = this.requireWebhookRoute(idOrPath);
+    const timestamp = nowIso();
+    this.db.query(`
+      UPDATE webhook_routes
+      SET status = $status, updated_at = $updatedAt
+      WHERE id = $id
+    `).run({ $id: route.id, $status: status, $updatedAt: timestamp });
+    return this.requireWebhookRoute(route.id);
+  }
+
+  rotateWebhookRouteSecret(idOrPath: string, secretRef: string): WebhookRoute {
+    if (!secretRef) throw new Error("webhook route secretRef is required");
+    const route = this.requireWebhookRoute(idOrPath);
+    if (!route.signature) throw new Error(`webhook route has no signature config: ${route.id}`);
+    const signature = canonicalWebhookSignature({ ...route.signature, secretRef })!;
+    const timestamp = nowIso();
+    this.db.query(`
+      UPDATE webhook_routes
+      SET signature_json = $signatureJson, updated_at = $updatedAt
+      WHERE id = $id
+    `).run({ $id: route.id, $signatureJson: JSON.stringify(signature), $updatedAt: timestamp });
+    return this.requireWebhookRoute(route.id);
   }
 
   createRun(input: {
@@ -574,14 +682,18 @@ export class AutomationsStore {
   }
 
   materializeEvent(event: EventEnvelopeLike, options: { automationId?: string } = {}): MaterializedEventRun[] {
+    return this.materializeEventWithContext(event, { automationId: options.automationId });
+  }
+
+  private materializeEventWithContext(event: EventEnvelopeLike, options: { automationId?: string; webhookRoute?: WebhookRoute } = {}): MaterializedEventRun[] {
     const automations = this.listAutomations().filter((automation) => {
       if (options.automationId && automation.id !== options.automationId) return false;
       if (automation.status !== "active") return false;
-      return automation.spec.triggers.some((trigger) => triggerMatchesEvent(trigger, event));
+      return automation.spec.triggers.some((trigger) => triggerMatchesEvent(trigger, event, { automation, webhookRoute: options.webhookRoute }));
     });
     const materialized: MaterializedEventRun[] = [];
     for (const automation of automations) {
-      const trigger = automation.spec.triggers.find((candidate) => triggerMatchesEvent(candidate, event));
+      const trigger = automation.spec.triggers.find((candidate) => triggerMatchesEvent(candidate, event, { automation, webhookRoute: options.webhookRoute }));
       if (!trigger) continue;
       const run = this.createRun({
         automationId: automation.id,
@@ -613,6 +725,20 @@ export class AutomationsStore {
     return materialized;
   }
 
+  materializeWebhookRequest(input: WebhookRequestInput): MaterializedWebhookRequest {
+    const route = this.requireWebhookRoute(input.route.id);
+    if (route.status !== "active") throw new Error(`webhook route is not active: ${route.id}`);
+    if (route.automationId !== input.route.automationId) {
+      throw new Error(`webhook route automation scope changed: ${route.id}`);
+    }
+    const event = normalizeWebhookRequestToEvent({
+      ...input,
+      route,
+    });
+    const materialized = this.materializeEventWithContext(event, { automationId: route.automationId, webhookRoute: route });
+    return { route, event, materialized };
+  }
+
   createReplayRequest(input: Omit<AutomationReplayRequest, "id" | "requestedAt"> & { id?: string; requestedAt?: string | Date }): AutomationReplayRequest {
     this.requireRun(input.sourceRunId);
     const id = input.id ?? randomUUID();
@@ -638,21 +764,22 @@ export class AutomationsStore {
     return replayFromRow(row);
   }
 
-  heartbeatDaemon(input: { leaseId?: string; ttlMs?: number; now?: Date } = {}): DaemonLeaseRow {
+  heartbeatDaemon(input: { leaseId?: string; ttlMs?: number; now?: Date; metadata?: JsonObject } = {}): DaemonLeaseRow {
     const now = input.now ?? new Date();
     const timestamp = now.toISOString();
     const ttlMs = input.ttlMs ?? 30000;
     const id = input.leaseId ?? `daemon:${hostname()}:${process.pid}`;
     const expiresAt = new Date(now.getTime() + ttlMs).toISOString();
     this.db.query(`
-      INSERT INTO daemon_leases (id, pid, hostname, heartbeat_at, expires_at, created_at, updated_at)
-      VALUES ($id, $pid, $hostname, $heartbeatAt, $expiresAt, $createdAt, $updatedAt)
+      INSERT INTO daemon_leases (id, pid, hostname, heartbeat_at, expires_at, created_at, updated_at, metadata_json)
+      VALUES ($id, $pid, $hostname, $heartbeatAt, $expiresAt, $createdAt, $updatedAt, $metadataJson)
       ON CONFLICT(id) DO UPDATE SET
         pid = excluded.pid,
         hostname = excluded.hostname,
         heartbeat_at = excluded.heartbeat_at,
         expires_at = excluded.expires_at,
-        updated_at = excluded.updated_at
+        updated_at = excluded.updated_at,
+        metadata_json = excluded.metadata_json
     `).run({
       $id: id,
       $pid: process.pid,
@@ -661,6 +788,7 @@ export class AutomationsStore {
       $expiresAt: expiresAt,
       $createdAt: timestamp,
       $updatedAt: timestamp,
+      $metadataJson: stringifyNullable(input.metadata),
     });
     return this.latestDaemonLease()!;
   }
@@ -682,6 +810,7 @@ export class AutomationsStore {
         queuedActions: this.count("automation_actions"),
         deadActions: this.count("automation_actions", "status = 'dead'"),
         replayRequests: this.count("automation_replay_requests"),
+        webhookRoutes: this.count("webhook_routes"),
       },
       daemon: {
         leaseId: lease?.id,
@@ -690,6 +819,7 @@ export class AutomationsStore {
         heartbeatAt: lease?.heartbeat_at,
         expiresAt: lease?.expires_at,
         active: lease ? new Date(lease.expires_at).getTime() > now.getTime() : false,
+        metadata: lease ? parseNullable<JsonObject>(lease.metadata_json) : undefined,
       },
     };
   }
@@ -766,13 +896,28 @@ export class AutomationsStore {
         heartbeat_at TEXT NOT NULL,
         expires_at TEXT NOT NULL,
         created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        metadata_json TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS webhook_routes (
+        id TEXT PRIMARY KEY,
+        automation_id TEXT NOT NULL,
+        path TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL,
+        signature_json TEXT,
+        mapping_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        metadata_json TEXT,
+        FOREIGN KEY (automation_id) REFERENCES automations(id) ON DELETE CASCADE
       );
     `);
 
     this.ensureColumn("automation_actions", "idempotency_key", "TEXT");
     this.ensureColumn("automation_actions", "result_json", "TEXT");
     this.ensureColumn("automation_actions", "error_json", "TEXT");
+    this.ensureColumn("daemon_leases", "metadata_json", "TEXT");
     this.db.exec(`
       UPDATE automation_actions
       SET idempotency_key = automation_run_id || ':' || step_id
@@ -786,6 +931,8 @@ export class AutomationsStore {
       CREATE UNIQUE INDEX IF NOT EXISTS automation_actions_idempotency_idx ON automation_actions(automation_run_id, idempotency_key);
       CREATE UNIQUE INDEX IF NOT EXISTS automation_actions_run_step_idx ON automation_actions(automation_run_id, step_id);
       CREATE INDEX IF NOT EXISTS automation_replay_source_idx ON automation_replay_requests(source_run_id);
+      CREATE INDEX IF NOT EXISTS webhook_routes_automation_idx ON webhook_routes(automation_id);
+      CREATE INDEX IF NOT EXISTS webhook_routes_status_idx ON webhook_routes(status);
       PRAGMA user_version = ${STORE_SCHEMA_VERSION};
     `);
   }
@@ -971,6 +1118,59 @@ function replayFromRow(row: ReplayRow): AutomationReplayRequest {
   });
 }
 
+function webhookRouteFromRow(row: WebhookRouteRow): WebhookRoute {
+  return pruneUndefined({
+    id: row.id,
+    automationId: row.automation_id,
+    path: row.path,
+    status: row.status,
+    signature: parseNullable<WebhookSignatureConfig>(row.signature_json),
+    mapping: JSON.parse(row.mapping_json) as WebhookEventMapping,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    metadata: parseNullable<JsonObject>(row.metadata_json),
+  });
+}
+
+export function normalizeWebhookRequestToEvent(input: WebhookRequestInput): EventEnvelopeLike {
+  const rawBody = bytesFromRawBody(input.rawBody);
+  const rawBodySha256 = sha256Hex(rawBody);
+  const body = parseJsonObject(rawBody);
+  const headers = normalizeHeaders(input.headers ?? {});
+  const mapping = input.route.mapping;
+  const receivedAt = normalizeIso(input.receivedAt);
+  const dedupeKey = resolveMappedString(mapping.dedupeKeyHeader ? headers[mapping.dedupeKeyHeader.toLowerCase()] : undefined)
+    ?? resolveMappedString(mapping.dedupeKeyPath ? readPath(body, mapping.dedupeKeyPath) : undefined)
+    ?? resolveMappedString(mapping.idPath ? readPath(body, mapping.idPath) : undefined)
+    ?? `body-sha256:${rawBodySha256}`;
+  const eventId = resolveMappedString(mapping.idPath ? readPath(body, mapping.idPath) : undefined)
+    ?? `webhook:${input.route.id}:${dedupeKey}`;
+  const subject = mapping.subject
+    ?? resolveMappedString(mapping.subjectPath ? readPath(body, mapping.subjectPath) : undefined);
+  const time = resolveMappedString(mapping.timePath ? readPath(body, mapping.timePath) : undefined) ?? receivedAt;
+  const data = mapping.dataPath ? resolveMappedData(readPath(body, mapping.dataPath), mapping.dataPath) : {};
+  return pruneUndefined({
+    id: eventId,
+    source: mapping.source,
+    type: mapping.type,
+    time,
+    subject,
+    data,
+    dedupeKey,
+    metadata: {
+      ...(mapping.metadata ?? {}),
+      webhook: {
+        routeId: input.route.id,
+        automationId: input.route.automationId,
+        path: input.route.path,
+        receivedAt,
+        rawBodySha256,
+        signatureConfigured: input.route.signature !== undefined,
+      },
+    },
+  });
+}
+
 function assertActiveLease(action: QueuedAction, runnerId: string, now: string): void {
   if (action.status !== "claimed") {
     throw new Error(`queued action is not claimed: ${action.id}`);
@@ -1057,8 +1257,18 @@ function defaultBackoffMs(attempt: number): number {
   return Math.min(60000, 1000 * 2 ** Math.max(0, attempt - 1));
 }
 
-function triggerMatchesEvent(trigger: AutomationTrigger, event: EventEnvelopeLike): boolean {
-  if (trigger.kind !== "event") return false;
+function triggerMatchesEvent(
+  trigger: AutomationTrigger,
+  event: EventEnvelopeLike,
+  context: { automation: AutomationRecord; webhookRoute?: WebhookRoute },
+): boolean {
+  if (trigger.kind === "webhook") {
+    if (!context.webhookRoute) return false;
+    if (context.webhookRoute.automationId !== context.automation.id) return false;
+    const webhookMetadata = event.metadata?.webhook;
+    if (!isPlainObject(webhookMetadata) || webhookMetadata.routeId !== context.webhookRoute.id) return false;
+  }
+  if (trigger.kind !== "event" && trigger.kind !== "webhook") return false;
   if (trigger.source && trigger.source !== event.source) return false;
   if (trigger.type && trigger.type !== event.type) return false;
   if (trigger.subject && trigger.subject !== event.subject) return false;
@@ -1078,6 +1288,105 @@ function objectFilterMatches(filter: JsonObject | undefined, data: JsonObject): 
 
 function isPlainObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function validateWebhookRouteFields(input: {
+  id: string;
+  path: string;
+  status: WebhookRouteStatus;
+  signature?: WebhookSignatureConfig;
+  mapping: WebhookEventMapping;
+}): void {
+  if (!input.id || !/^[a-zA-Z0-9][a-zA-Z0-9._:-]*$/.test(input.id)) {
+    throw new Error("webhook route id must start with an alphanumeric character and contain only letters, numbers, dots, underscores, colons, or dashes");
+  }
+  if (!(WEBHOOK_ROUTE_STATUSES as readonly string[]).includes(input.status)) {
+    throw new Error(`unsupported webhook route status: ${input.status}`);
+  }
+  normalizeWebhookPath(input.path);
+  if (!input.mapping.source) throw new Error("webhook route mapping.source is required");
+  if (!input.mapping.type) throw new Error("webhook route mapping.type is required");
+  if (input.signature) {
+    if (input.signature.algorithm !== "hmac-sha256") throw new Error(`unsupported webhook signature algorithm: ${input.signature.algorithm}`);
+    if (!input.signature.secretRef) throw new Error("webhook signature secretRef is required");
+    if (input.signature.encoding && input.signature.encoding !== "hex" && input.signature.encoding !== "base64") {
+      throw new Error(`unsupported webhook signature encoding: ${input.signature.encoding}`);
+    }
+  }
+}
+
+function canonicalWebhookSignature(signature: WebhookSignatureConfig | undefined): WebhookSignatureConfig | undefined {
+  if (!signature) return undefined;
+  const allowedKeys = new Set(["algorithm", "secretRef", "header", "encoding", "prefix"]);
+  for (const key of Object.keys(signature as unknown as Record<string, unknown>)) {
+    if (!allowedKeys.has(key)) throw new Error(`unsupported webhook signature field: ${key}`);
+  }
+  if (signature.algorithm !== "hmac-sha256") throw new Error(`unsupported webhook signature algorithm: ${signature.algorithm}`);
+  if (!signature.secretRef) throw new Error("webhook signature secretRef is required");
+  if (!signature.secretRef.startsWith("secret://")) throw new Error("webhook signature secretRef must be a secret:// reference");
+  if (signature.encoding && signature.encoding !== "hex" && signature.encoding !== "base64") {
+    throw new Error(`unsupported webhook signature encoding: ${signature.encoding}`);
+  }
+  return pruneUndefined({
+    algorithm: signature.algorithm,
+    secretRef: signature.secretRef,
+    header: signature.header,
+    encoding: signature.encoding,
+    prefix: signature.prefix,
+  });
+}
+
+function normalizeWebhookPath(path: string): string {
+  if (!path.startsWith("/")) throw new Error("webhook route path must start with /");
+  if (path.includes("?") || path.includes("#")) throw new Error("webhook route path must not include query or fragment");
+  if (path.includes("..")) throw new Error("webhook route path must not contain ..");
+  return path.replace(/\/+/g, "/");
+}
+
+function bytesFromRawBody(rawBody: string | Uint8Array): Uint8Array {
+  return typeof rawBody === "string" ? new TextEncoder().encode(rawBody) : rawBody;
+}
+
+function sha256Hex(bytes: Uint8Array): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function parseJsonObject(bytes: Uint8Array): JsonObject {
+  const text = new TextDecoder().decode(bytes);
+  const parsed = JSON.parse(text) as unknown;
+  if (!isPlainObject(parsed)) throw new Error("webhook payload must be a JSON object");
+  return parsed;
+}
+
+function normalizeHeaders(headers: Record<string, string | undefined>): Record<string, string> {
+  const normalized: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (value !== undefined) normalized[key.toLowerCase()] = value;
+  }
+  return normalized;
+}
+
+function readPath(root: JsonObject, path: string): JsonValue | undefined {
+  if (path === "." || path === "$") return root;
+  let current: JsonValue | undefined = root;
+  for (const segment of path.split(".")) {
+    if (!segment) throw new Error(`invalid webhook mapping path: ${path}`);
+    if (!isPlainObject(current)) return undefined;
+    current = current[segment];
+  }
+  return current;
+}
+
+function resolveMappedString(value: JsonValue | undefined): string | undefined {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  return undefined;
+}
+
+function resolveMappedData(value: JsonValue | undefined, path: string): JsonObject {
+  if (value === undefined) return {};
+  if (!isPlainObject(value)) throw new Error(`webhook route dataPath must resolve to a JSON object: ${path}`);
+  return value;
 }
 
 function nowIso(): string {

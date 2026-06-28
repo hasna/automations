@@ -37,10 +37,14 @@ automations --json queue claim --runner worker-1
 automations --json queue fail <action-id> --code UPSTREAM_500 --message "upstream failed"
 automations --json dlq list
 automations --json dlq replay <action-id>
+automations --json webhooks create tickets.escalate-critical --id tickets --path /webhooks/tickets --source open-events --type ticket.created --data-path data --dedupe-key-header X-Hasna-Event-Id --secret-ref secret://automations/webhooks/tickets
+automations --json webhooks event tickets --body-json '{"data":{"priority":"critical"}}' --header X-Hasna-Event-Id:evt_1
+automations --json webhooks test tickets --body-json '{"data":{"priority":"critical"}}' --header X-Hasna-Event-Id:evt_1
 automations --json runtimes
 automations-daemon --json status
 automations-daemon --json run
 automations-daemon --json run --once
+automations-daemon --json serve --host 127.0.0.1 --port 7391
 ```
 
 The default data root is `~/.hasna/automations`. Override it with
@@ -90,3 +94,39 @@ automations queue fail <action-id> --runner open-loops:<worker-id> --code <code>
 
 The queue enforces runner ownership and live leases for completion/failure, so
 stale workers cannot finalize reclaimed actions.
+
+Webhook ingress uses the same materialization path. The daemon accepts `POST`
+requests on registered webhook paths, verifies HMAC SHA-256 signatures over the
+exact raw request bytes when a route has `secretRef`, normalizes the request
+into an event envelope, and then calls the durable materializer. It never stores
+raw webhook secrets, raw signatures, request headers, or raw payload blobs by
+default; route metadata stores secret references and body hashes only.
+
+At runtime the daemon resolves signed route secrets from route-scoped
+environment variables:
+
+```sh
+HASNA_AUTOMATIONS_WEBHOOK_SECRET_<ROUTE_ID>
+AUTOMATIONS_WEBHOOK_SECRET_<ROUTE_ID>
+HASNA_AUTOMATIONS_SECRET_<SECRET_REF_WITHOUT_SECRET_SCHEME>
+```
+
+For explicit OpenLoops event workflow routing, export only the normalized event
+envelope and pipe it into OpenLoops:
+
+```bash
+automations --json webhooks event tickets \
+  --body-json '{"data":{"priority":"critical"}}' \
+  --header X-Hasna-Event-Id:evt_1 \
+  | loops --json events handle generic
+```
+
+`webhooks event` and `webhooks test` are local operator commands. They do not
+verify HMAC signatures or accept network requests; use `automations-daemon serve`
+for signed ingress.
+
+This event-envelope handoff is operator opt-in. OpenAutomations still owns
+automation specs, trigger materialization, durable queue state, approvals, DLQ,
+and replay. OpenLoops owns agent workflow invocation when `loops events handle
+generic` is used, and it can also act as a queue worker through the claim/complete
+commands above.

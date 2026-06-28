@@ -31,6 +31,7 @@ describe("AutomationsStore", () => {
           queuedActions: 0,
           deadActions: 0,
           replayRequests: 0,
+          webhookRoutes: 0,
         },
         daemon: { active: false },
       });
@@ -109,7 +110,7 @@ describe("AutomationsStore", () => {
 
       const lease = store.heartbeatDaemon({ leaseId: "daemon:test", now: new Date("2026-06-28T00:00:00.000Z") });
       expect(lease.id).toBe("daemon:test");
-      expect((store.db.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(1);
+      expect((store.db.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(3);
 
       const claimed = store.claimNextAction({ runnerId: "tester", now: "2026-06-28T00:00:01.000Z" });
       expect(claimed).toMatchObject({ id: action.id, status: "claimed", claimedBy: "tester" });
@@ -168,6 +169,7 @@ describe("AutomationsStore", () => {
           queuedActions: 1,
           deadActions: 0,
           replayRequests: 2,
+          webhookRoutes: 0,
         },
         daemon: { active: true, leaseId: "daemon:test" },
       });
@@ -203,6 +205,196 @@ describe("AutomationsStore", () => {
       expect(duplicate[0]?.run.id).toBe(materialized[0]?.run.id);
       expect(store.listRuns()).toHaveLength(1);
       expect(store.listQueuedActions()).toHaveLength(1);
+    } finally {
+      store.close();
+    }
+  });
+
+  test("persists webhook routes without raw secrets and materializes scoped webhook events idempotently", () => {
+    const store = new AutomationsStore();
+    try {
+      store.createAutomation({
+        schemaVersion: "1.0",
+        id: "webhook-scope",
+        name: "Webhook scope",
+        version: "1.0.0",
+        triggers: [{ kind: "webhook", source: "github", type: "push", filter: { branch: "main" } }],
+        actions: [
+          { id: "enqueue", actionId: "actions.enqueue" },
+        ],
+      });
+      store.createAutomation({
+        schemaVersion: "1.0",
+        id: "forged-target",
+        name: "Forged target",
+        version: "1.0.0",
+        triggers: [{ kind: "event", source: "evil", type: "push" }],
+        actions: [
+          { id: "forged", actionId: "actions.forged" },
+        ],
+      });
+      const forgedWebhookEvent = store.materializeEvent({
+        id: "evt_forged_webhook",
+        source: "github",
+        type: "push",
+        data: { branch: "main" },
+        metadata: {
+          webhook: {
+            routeId: "github-main",
+            automationId: "webhook-scope",
+          },
+        },
+      });
+      expect(forgedWebhookEvent).toHaveLength(0);
+
+      const route = store.createWebhookRoute({
+        id: "github-main",
+        automationId: "webhook-scope",
+        path: "/webhooks/github/main",
+        signature: {
+          algorithm: "hmac-sha256",
+          secretRef: "secret://automations/webhooks/github-main",
+          header: "X-Hub-Signature-256",
+          prefix: "sha256=",
+        },
+        mapping: {
+          source: "github",
+          type: "push",
+          dataPath: "payload",
+          dedupeKeyHeader: "X-GitHub-Delivery",
+          metadata: { provider: "github" },
+        },
+      });
+      expect(route).toMatchObject({
+        id: "github-main",
+        automationId: "webhook-scope",
+        status: "active",
+        signature: { secretRef: "secret://automations/webhooks/github-main" },
+      });
+      const signatureJson = (store.db.query("SELECT signature_json FROM webhook_routes WHERE id = 'github-main'").get() as { signature_json: string }).signature_json;
+      expect(signatureJson).not.toContain("shared-secret");
+      expect(signatureJson).not.toContain("rawSignature");
+      const forgedWithRouteOption = store.materializeEvent({
+        id: "evt_forged_route_option",
+        source: "github",
+        type: "push",
+        data: { branch: "main" },
+        metadata: {
+          webhook: {
+            routeId: "github-main",
+            automationId: "webhook-scope",
+          },
+        },
+      }, { webhookRoute: route } as never);
+      expect(forgedWithRouteOption).toHaveLength(0);
+      expect(() => store.createWebhookRoute({
+        id: "bad-signature",
+        automationId: "webhook-scope",
+        mapping: { source: "github", type: "push" },
+        signature: {
+          algorithm: "hmac-sha256",
+          secretRef: "secret://automations/webhooks/bad-signature",
+          secret: "shared-secret",
+        } as never,
+      })).toThrow("unsupported webhook signature field: secret");
+
+      const rawBody = JSON.stringify({
+        id: "body-id-that-should-not-win",
+        source: "evil",
+        type: "push",
+        payload: {
+          branch: "main",
+          repository: "open-automations",
+        },
+      });
+      const materialized = store.materializeWebhookRequest({
+        route,
+        rawBody,
+        headers: {
+          "X-GitHub-Delivery": "delivery-1",
+          "X-Hub-Signature-256": "sha256=redacted",
+        },
+        receivedAt: "2026-06-28T00:00:00.000Z",
+      });
+
+      expect(materialized.event).toMatchObject({
+        source: "github",
+        type: "push",
+        dedupeKey: "delivery-1",
+        data: {
+          branch: "main",
+          repository: "open-automations",
+        },
+        metadata: {
+          provider: "github",
+          webhook: {
+            routeId: "github-main",
+            automationId: "webhook-scope",
+            path: "/webhooks/github/main",
+            signatureConfigured: true,
+          },
+        },
+      });
+      expect(JSON.stringify(materialized.event.metadata)).not.toContain("redacted");
+      expect(JSON.stringify(materialized.event.metadata)).not.toContain(rawBody);
+      expect(materialized.materialized).toHaveLength(1);
+      expect(materialized.materialized[0]?.automation.id).toBe("webhook-scope");
+      expect(materialized.materialized[0]?.actions[0]?.idempotencyKey).toBe("webhook-scope:delivery-1:enqueue");
+
+      const duplicate = store.materializeWebhookRequest({
+        route,
+        rawBody,
+        headers: { "X-GitHub-Delivery": "delivery-1" },
+        receivedAt: "2026-06-28T00:00:01.000Z",
+      });
+      expect(duplicate.materialized[0]?.run.id).toBe(materialized.materialized[0]?.run.id);
+      expect(store.listRuns()).toHaveLength(1);
+      expect(store.listQueuedActions()).toHaveLength(1);
+      expect(store.status()).toMatchObject({ counts: { webhookRoutes: 1 } });
+    } finally {
+      store.close();
+    }
+  });
+
+  test("normalizes webhook requests with deterministic body-hash dedupe and no raw data by default", () => {
+    const store = new AutomationsStore();
+    try {
+      store.createAutomation({
+        schemaVersion: "1.0",
+        id: "webhook-default-data",
+        name: "Webhook default data",
+        version: "1.0.0",
+        triggers: [{ kind: "event", source: "stripe", type: "invoice.created" }],
+        actions: [
+          { id: "record", actionId: "actions.record" },
+        ],
+      });
+      const route = store.createWebhookRoute({
+        id: "stripe-invoices",
+        automationId: "webhook-default-data",
+        path: "/webhooks/stripe/invoices",
+        mapping: {
+          source: "stripe",
+          type: "invoice.created",
+          idPath: "id",
+        },
+      });
+      const result = store.materializeWebhookRequest({
+        route,
+        rawBody: JSON.stringify({ id: "evt_invoice_1", amount: 1000 }),
+        receivedAt: "2026-06-28T00:00:00.000Z",
+      });
+      expect(result.event).toMatchObject({
+        id: "evt_invoice_1",
+        source: "stripe",
+        type: "invoice.created",
+        data: {},
+        dedupeKey: "evt_invoice_1",
+      });
+      expect(result.event.metadata?.webhook).toMatchObject({
+        routeId: "stripe-invoices",
+        rawBodySha256: expect.any(String),
+      });
     } finally {
       store.close();
     }

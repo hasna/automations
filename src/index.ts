@@ -2,8 +2,10 @@ export * from "./types.js";
 export {
   AutomationsStore,
   exampleAutomationSpec,
+  normalizeWebhookRequestToEvent,
   validateAutomationSpec,
   type AutomationsStoreOptions,
+  type CreateWebhookRouteInput,
   type EnqueueActionInput,
 } from "./lib/store.js";
 export {
