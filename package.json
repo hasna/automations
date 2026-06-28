@@ -1,6 +1,6 @@
 {
   "name": "@hasna/automations",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Deterministic automation control plane and daemon for Hasna open-source apps",
   "type": "module",
   "main": "./dist/index.js",
