@@ -5,7 +5,7 @@ export function createOpenLoopsRuntimeBinding(metadata: JsonObject = {}): Automa
   return {
     kind: "open-loops",
     name: "open-loops-runtime",
-    description: "OpenLoops may claim queued OpenAutomations actions or consume explicitly exported event envelopes through opt-in handoff commands.",
+    description: "OpenLoops may claim queued deterministic OpenAutomations actions or consume explicitly exported event envelopes through opt-in handoff commands. Agent workflow invocation remains owned by OpenLoops.",
     handoff: "claim-queue",
     metadata: {
       queueClaim: {
@@ -18,7 +18,7 @@ export function createOpenLoopsRuntimeBinding(metadata: JsonObject = {}): Automa
         exportCommand: "automations webhooks event <route-id-or-path> --body-json <json>",
         openLoopsCommand: "loops events handle generic",
         pipeExample: "automations --json webhooks event <route> --body-json '<json>' | loops --json events handle generic",
-        boundary: "Event-envelope handoff is explicit operator routing; OpenLoops owns workflow invocation, while OpenAutomations owns deterministic automation specs, materialization, queues, approvals, DLQ, and replay.",
+        boundary: "Event-envelope handoff is explicit operator routing; OpenLoops owns agent workflow invocation, admission, and run artifacts, while OpenAutomations owns deterministic automation specs, materialization, action queues, approvals, DLQ, and replay.",
       },
       ...metadata,
     },

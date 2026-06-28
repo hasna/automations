@@ -3,10 +3,10 @@
 Deterministic automation control plane and daemon for Hasna open-source apps.
 
 `open-automations` is the real automation product surface. It owns automation
-specs, trigger materialization, durable run/action queue state, replay requests,
-daemon leases, and release-grade audit boundaries. It uses `@hasna/actions` as
-the action contract layer and can hand execution to runtime providers such as
-OpenLoops without turning those runtimes into the automation product.
+specs, trigger materialization, deterministic run/action queue state, replay
+requests, daemon leases, and release-grade audit boundaries. It uses
+`@hasna/actions` as the action contract layer and can hand deterministic action
+execution to runtime providers without owning agent workflow invocation.
 
 ## Package
 
@@ -58,8 +58,10 @@ it receives `SIGINT` or `SIGTERM`. Use `--once` for smoke checks and tests.
 - `open-actions` defines portable action manifests and invocation contracts.
 - `open-events` is trigger ingress.
 - `open-automations` materializes triggers into durable automation runs and
-  queued action work.
-- `open-loops` can be a runtime binding, but it is not the automation product.
+  queued deterministic action work.
+- `open-loops` owns agent workflow invocation, admission, and workflow run
+  artifacts. It can consume explicit event envelopes from OpenAutomations, but
+  it is not the automation product.
 
 ## Runtime Model
 
@@ -77,8 +79,9 @@ event-to-run and event-to-action idempotency keys. Replaying the same event
 through OpenEvents therefore returns the existing run/action rows unless the
 operator creates an explicit replay request through OpenAutomations.
 
-OpenLoops is an execution runtime binding, not the scheduler or control plane
-for automations. A runtime worker claims queued actions with:
+OpenLoops is an optional runtime binding for deterministic OpenAutomations
+actions, not the scheduler or control plane for automations. A runtime worker
+claims queued deterministic actions with:
 
 ```sh
 automations queue claim --runner open-loops:<worker-id>
@@ -126,7 +129,7 @@ verify HMAC signatures or accept network requests; use `automations-daemon serve
 for signed ingress.
 
 This event-envelope handoff is operator opt-in. OpenAutomations still owns
-automation specs, trigger materialization, durable queue state, approvals, DLQ,
-and replay. OpenLoops owns agent workflow invocation when `loops events handle
-generic` is used, and it can also act as a queue worker through the claim/complete
-commands above.
+automation specs, trigger materialization, deterministic action queue state,
+approvals, DLQ, and replay. OpenLoops owns agent workflow invocation, admission,
+and `.hasna/loops/runs` artifacts when `loops events handle generic` is used.
+OpenAutomations never owns task, PR, review, or agent workflow queues.
