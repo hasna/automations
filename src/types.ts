@@ -2,10 +2,10 @@ import type {
   ActionDeadLetter,
   ActionError,
   ActionInvocation,
+  ActionQueueApprovalGate,
+  ActionQueueApprovalRequirement,
+  ActionQueueStatus,
   ActionResult,
-  ActionRunStatus,
-  ApprovalGate,
-  ApprovalRequirement,
   JsonObject,
   JsonValue,
 } from "@hasna/actions";
@@ -119,7 +119,7 @@ export interface MaterializedWebhookRequest {
   materialized: MaterializedEventRun[];
 }
 
-export type AutomationApprovalGateTemplate = Omit<ApprovalGate, "decision"> & {
+export type AutomationApprovalGateTemplate = Omit<ActionQueueApprovalGate, "decision"> & {
   decision?: never;
 };
 
@@ -130,7 +130,7 @@ export interface AutomationActionStep {
   input?: JsonValue;
   dependsOn?: string[];
   when?: JsonObject;
-  approval?: ApprovalRequirement;
+  approval?: ActionQueueApprovalRequirement;
   approvalGate?: AutomationApprovalGateTemplate;
   metadata?: JsonObject;
 }
@@ -184,7 +184,7 @@ export interface QueuedAction {
   stepId: string;
   actionId: string;
   idempotencyKey: string;
-  status: ActionRunStatus;
+  status: ActionQueueStatus;
   invocation: ActionInvocation<JsonValue>;
   attempt: number;
   maxAttempts: number;
@@ -194,7 +194,7 @@ export interface QueuedAction {
   claimedBy?: string;
   claimedAt?: string;
   leaseExpiresAt?: string;
-  approvalGate?: ApprovalGate;
+  approvalGate?: ActionQueueApprovalGate;
   result?: ActionResult;
   error?: ActionError;
   deadLetter?: ActionDeadLetter;

@@ -7,13 +7,13 @@ import type {
   ActionDeadLetter,
   ActionError,
   ActionInvocation,
+  ActionQueueApprovalDecision,
+  ActionQueueApprovalGate,
   ActionResult,
-  ApprovalDecision,
-  ApprovalGate,
   JsonObject,
   JsonValue,
 } from "@hasna/actions";
-import { assertActionRunStatus, isTerminalActionStatus } from "@hasna/actions";
+import { assertActionQueueStatus, isTerminalActionQueueStatus } from "@hasna/actions";
 import type {
   ActionCompletionOptions,
   ActionFailureOptions,
@@ -139,7 +139,7 @@ export interface EnqueueActionInput {
   attempt?: number;
   maxAttempts?: number;
   availableAt?: string | Date;
-  approvalGate?: ApprovalGate;
+  approvalGate?: ActionQueueApprovalGate;
   result?: ActionResult;
   error?: ActionError;
   deadLetter?: ActionDeadLetter;
@@ -338,7 +338,7 @@ export class AutomationsStore {
     const timestamp = nowIso();
     const id = input.id ?? randomUUID();
     const idempotencyKey = input.idempotencyKey ?? input.invocation.idempotencyKey ?? `${input.automationRunId}:${input.stepId}`;
-    const status = assertActionRunStatus(input.status ?? "queued");
+    const status = assertActionQueueStatus(input.status ?? "queued");
     const existing = this.db.query(`
       SELECT * FROM automation_actions
       WHERE automation_run_id = $automationRunId
@@ -466,7 +466,7 @@ export class AutomationsStore {
     const now = normalizeIso(options.now);
     return withImmediateTransaction(this.db, () => {
       const action = this.requireQueuedAction(options.actionId);
-      if (isTerminalActionStatus(action.status)) {
+      if (isTerminalActionQueueStatus(action.status)) {
         throw new Error(`cannot complete terminal queued action: ${options.actionId}`);
       }
       assertActiveLease(action, options.runnerId, now);
@@ -499,7 +499,7 @@ export class AutomationsStore {
     const now = normalizeIso(options.now);
     return withImmediateTransaction(this.db, () => {
       const action = this.requireQueuedAction(options.actionId);
-      if (isTerminalActionStatus(action.status)) {
+      if (isTerminalActionQueueStatus(action.status)) {
         throw new Error(`cannot fail terminal queued action: ${options.actionId}`);
       }
       assertActiveLease(action, options.runnerId, now);
@@ -601,7 +601,7 @@ export class AutomationsStore {
     return withImmediateTransaction(this.db, () => {
       const action = this.requireQueuedAction(id);
       assertApprovalTransitionAllowed(action, "approve");
-      const decision: ApprovalDecision = {
+      const decision: ActionQueueApprovalDecision = {
         id: randomUUID(),
         status: "approved",
         requestedAt: action.approvalGate!.decision?.requestedAt ?? action.createdAt,
@@ -609,7 +609,7 @@ export class AutomationsStore {
         reason: options.reason,
         metadata: options.decidedBy ? { decidedBy: options.decidedBy } : undefined,
       };
-      const gate: ApprovalGate = {
+      const gate: ActionQueueApprovalGate = {
         ...action.approvalGate!,
         blockedUntilApproved: false,
         decision,
@@ -639,7 +639,7 @@ export class AutomationsStore {
     return withImmediateTransaction(this.db, () => {
       const action = this.requireQueuedAction(id);
       assertApprovalTransitionAllowed(action, "reject");
-      const decision: ApprovalDecision = {
+      const decision: ActionQueueApprovalDecision = {
         id: randomUUID(),
         status: "rejected",
         requestedAt: action.approvalGate!.decision?.requestedAt ?? action.createdAt,
@@ -647,7 +647,7 @@ export class AutomationsStore {
         reason: options.reason,
         metadata: options.decidedBy ? { decidedBy: options.decidedBy } : undefined,
       };
-      const gate: ApprovalGate = {
+      const gate: ActionQueueApprovalGate = {
         ...action.approvalGate!,
         blockedUntilApproved: true,
         decision,
@@ -1098,7 +1098,7 @@ function actionFromRow(row: ActionRow): QueuedAction {
     claimedBy: row.claimed_by ?? undefined,
     claimedAt: row.claimed_at ?? undefined,
     leaseExpiresAt: row.lease_expires_at ?? undefined,
-    approvalGate: parseNullable<ApprovalGate>(row.approval_gate_json),
+    approvalGate: parseNullable<ActionQueueApprovalGate>(row.approval_gate_json),
     result: parseNullable<ActionResult>(row.result_json),
     error: parseNullable<ActionError>(row.error_json),
     deadLetter: parseNullable<ActionDeadLetter>(row.dead_letter_json),
@@ -1191,7 +1191,7 @@ function assertClaimedActionUpdated(changes: number, actionId: string, runnerId:
 
 function assertApprovalTransitionAllowed(action: QueuedAction, operation: "approve" | "reject"): void {
   if (!action.approvalGate) throw new Error(`queued action has no approval gate: ${action.id}`);
-  if (isTerminalActionStatus(action.status)) {
+  if (isTerminalActionQueueStatus(action.status)) {
     throw new Error(`cannot ${operation} terminal queued action: ${action.id}`);
   }
   if (action.status === "claimed" || action.claimedBy || action.claimedAt || action.leaseExpiresAt) {
@@ -1213,12 +1213,12 @@ function assertApprovalTransitionUpdated(changes: number, actionId: string): voi
 
 function approvalGateAllowsClaim(value: string | null): boolean {
   if (!value) return true;
-  const gate = JSON.parse(value) as ApprovalGate;
+  const gate = JSON.parse(value) as ActionQueueApprovalGate;
   if (!gate.requirement.requiresApproval) return true;
   return gate.blockedUntilApproved === false && gate.decision?.status === "approved";
 }
 
-function materializeApprovalGate(step: AutomationActionStep, requestedAt: string): ApprovalGate | undefined {
+function materializeApprovalGate(step: AutomationActionStep, requestedAt: string): ActionQueueApprovalGate | undefined {
   const requirement = step.approval ?? step.approvalGate?.requirement;
   if (!requirement?.requiresApproval) return undefined;
   return {
